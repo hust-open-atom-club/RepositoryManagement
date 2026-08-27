@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -106,49 +107,139 @@ def gh_api_pages(
     *,
     empty_on_conflict: bool = False,
 ) -> list[Any]:
-    command = ["gh", "api", "--method", "GET", "--paginate", "--slurp", endpoint]
-    for key, value in (fields or {}).items():
-        command.extend(["-f", f"{key}={value}"])
+    request_fields = dict(fields or {})
+    per_page = int(request_fields.get("per_page", "100"))
+    items: list[Any] = []
+    page = 1
 
-    result: subprocess.CompletedProcess[str] | None = None
-    for attempt in range(1, 4):
-        try:
-            result = subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            break
-        except FileNotFoundError:
-            raise RuntimeError("GitHub CLI (gh) is not installed or is not on PATH")
-        except subprocess.CalledProcessError as error:
-            detail = error.stderr.strip() or error.stdout.strip() or "unknown gh error"
-            if empty_on_conflict and "HTTP 409" in detail:
+    while True:
+        command = ["gh", "api", "--method", "GET", "--include", endpoint]
+        for key, value in request_fields.items():
+            command.extend(["-f", f"{key}={value}"])
+        command.extend(["-f", f"page={page}"])
+
+        for attempt in range(1, 4):
+            try:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except FileNotFoundError:
+                raise RuntimeError("GitHub CLI (gh) is not installed or is not on PATH")
+
+            status, headers, body = parse_included_response(result.stdout)
+            detail = result.stderr.strip() or body.strip() or "unknown gh error"
+
+            if result.returncode == 0:
+                try:
+                    page_items = json.loads(body)
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(
+                        f"GitHub API returned invalid JSON for {endpoint}"
+                    ) from error
+                if not isinstance(page_items, list):
+                    raise RuntimeError(
+                        f"GitHub API returned a non-list response for {endpoint}"
+                    )
+                items.extend(page_items)
+                if len(page_items) < per_page:
+                    return items
+                page += 1
+                break
+
+            if empty_on_conflict and status == 409:
                 return []
-            if attempt < 3 and retryable_api_error(detail):
-                time.sleep(2 ** (attempt - 1))
+
+            rate_limited = is_rate_limit_response(status, headers, detail)
+            retryable = rate_limited or retryable_api_error(detail, status)
+            if attempt < 3 and retryable:
+                delay = (
+                    rate_limit_delay(headers, attempt)
+                    if rate_limited
+                    else 2 ** (attempt - 1)
+                )
+                time.sleep(delay)
                 continue
             raise RuntimeError(
-                f"GitHub API request failed for {endpoint} after {attempt} "
-                f"attempt(s): {detail}"
-            ) from error
-
-    if result is None:  # Defensive; the loop either succeeds or raises.
-        raise RuntimeError(f"GitHub API request failed for {endpoint}")
-
-    try:
-        pages = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"GitHub API returned invalid JSON for {endpoint}") from error
-
-    return [item for page in pages for item in page]
+                f"GitHub API request failed for {endpoint} page {page} after "
+                f"{attempt} attempt(s): {detail}"
+            )
 
 
-def retryable_api_error(detail: str) -> bool:
+def parse_included_response(output: str) -> tuple[int | None, dict[str, str], str]:
+    normalized = output.replace("\r\n", "\n")
+    remainder = normalized
+    status: int | None = None
+    headers: dict[str, str] = {}
+
+    while remainder.startswith("HTTP/"):
+        header_block, separator, remainder = remainder.partition("\n\n")
+        if not separator:
+            return None, {}, normalized
+        lines = header_block.splitlines()
+        parts = lines[0].split()
+        status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        headers = {}
+        for line in lines[1:]:
+            name, separator, value = line.partition(":")
+            if separator:
+                headers[name.strip().casefold()] = value.strip()
+
+    return status, headers, remainder
+
+
+def is_rate_limit_response(
+    status: int | None, headers: dict[str, str], detail: str
+) -> bool:
+    lowered_detail = detail.casefold()
+    reported_403 = status == 403 or "http 403" in lowered_detail
+    reported_429 = status == 429 or "http 429" in lowered_detail
+    return (
+        reported_429
+        or headers.get("retry-after") is not None
+        or (
+            reported_403
+            and (
+                headers.get("x-ratelimit-remaining") == "0"
+                or "rate limit" in lowered_detail
+                or "secondary rate" in lowered_detail
+            )
+        )
+    )
+
+
+def rate_limit_delay(
+    headers: dict[str, str], attempt: int, now: float | None = None
+) -> float:
+    current_time = time.time() if now is None else now
+    retry_after = headers.get("retry-after")
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after).timestamp()
+                return max(0.0, retry_at - current_time)
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    reset = headers.get("x-ratelimit-reset")
+    if reset:
+        try:
+            return max(1.0, float(reset) - current_time + 1.0)
+        except ValueError:
+            pass
+
+    # GitHub recommends waiting at least one minute before retrying a secondary
+    # rate limit when neither Retry-After nor a reset time is provided.
+    return min(60.0 * (2 ** (attempt - 1)), 900.0)
+
+
+def retryable_api_error(detail: str, status: int | None = None) -> bool:
     transient_markers = (
         "EOF",
-        "HTTP 429",
         "HTTP 500",
         "HTTP 502",
         "HTTP 503",
@@ -160,7 +251,9 @@ def retryable_api_error(detail: str) -> bool:
         "timed out",
     )
     lowered_detail = detail.casefold()
-    return any(marker.casefold() in lowered_detail for marker in transient_markers)
+    return status in {500, 502, 503, 504} or any(
+        marker.casefold() in lowered_detail for marker in transient_markers
+    )
 
 
 def selected_repositories(
